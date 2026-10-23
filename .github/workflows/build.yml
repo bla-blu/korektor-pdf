@@ -18,7 +18,7 @@ jobs:
           - { os: macos-15-intel,   name: macos-x64 }     # Maki z procesorem Intel
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Zależności systemowe (Linux)
         if: runner.os == 'Linux'
@@ -72,13 +72,13 @@ jobs:
           done
           test -f "korektor-pdf-${{ matrix.name }}.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: runner.os != 'macOS'
         with:
           name: korektor-pdf-${{ matrix.name }}
           path: dist/bin
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: runner.os == 'macOS'
         with:
           name: korektor-pdf-${{ matrix.name }}
