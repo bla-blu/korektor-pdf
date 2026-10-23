@@ -2,6 +2,7 @@
 // Użycie: korektor_embed wyjście.cpp [--decl nagłówek.h TABLICA LICZNIK] NAZWA1 plik1 [NAZWA2 plik2 ...]
 // Bez --decl: czcionki (Fonts.h, kFontFiles, kFontFileCount).
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -49,7 +50,13 @@ int main(int argc, char** argv) {
         std::string prev((std::istreambuf_iterator<char>(old)), std::istreambuf_iterator<char>());
         if (prev == out) return 0;
     }
+    // katalog wyjściowy zakłada samo narzędzie (Ninja robi to za nas, Makefile i Xcode — nie)
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::path(argv[1]).parent_path();
+    if (!dir.empty()) std::filesystem::create_directories(dir, ec);
     std::ofstream o(argv[1], std::ios::binary);
     o << out;
-    return o ? 0 : 1;
+    o.close();
+    if (!o) { std::fprintf(stderr, "nie można zapisać %s\n", argv[1]); return 1; }
+    return 0;
 }

@@ -56,6 +56,7 @@ foreach(_f IN LISTS KOREKTOR_FONT_FILES)
   list(APPEND _font_args "${_f}" "${KOREKTOR_FONT_DIR}/${_f}.ttf")
   list(APPEND _font_deps "${KOREKTOR_FONT_DIR}/${_f}.ttf")
 endforeach()
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")   # na pliki tworzone przez korektor_embed
 set(KOREKTOR_FONT_CPP "${CMAKE_BINARY_DIR}/generated/FontData.cpp")
 add_custom_command(
   OUTPUT "${KOREKTOR_FONT_CPP}"
