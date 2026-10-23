@@ -1,0 +1,3 @@
+// Zasoby programu dla Windows: ikona pliku .exe (Eksplorator, pasek zadań, skróty).
+// Katalog assets jest przekazywany kompilatorowi zasobów jako ścieżka wyszukiwania (CMakeLists.txt).
+IDI_ICON1 ICON "korektor.ico"
