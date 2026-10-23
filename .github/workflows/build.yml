@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     name: linux-x64 }
+          - { os: ubuntu-24.04-arm, name: linux-arm64 }
+          - { os: windows-latest,   name: windows-x64 }
+          - { os: macos-14,         name: macos-arm64 }   # Apple Silicon (M1, M2, …)
+          - { os: macos-15-intel,   name: macos-x64 }     # Maki z procesorem Intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zależności systemowe (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev libgl1-mesa-dev xorg-dev \
+            libwayland-dev libxkbcommon-dev wayland-protocols
+
+      - name: Konfiguracja
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Kompilacja
+        run: cmake --build build --config Release --parallel
+
+      - name: Test rdzenia
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Pakiet
+        run: cmake --install build --config Release --prefix dist
+
+      # ---------- macOS: kontrola pakietu, próbne uruchomienie, obraz dysku ----------
+      - name: Kontrola pakietu (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/bin/Korektor PDF.app"
+          ls -R "$APP"
+          plutil -lint "$APP/Contents/Info.plist"
+          otool -L "$APP/Contents/MacOS/Korektor PDF"
+          otool -l "$APP/Contents/MacOS/Korektor PDF" | grep -A2 LC_RPATH
+          otool -D "$APP/Contents/Frameworks/libpdfium.dylib"
+          lipo -info "$APP/Contents/MacOS/Korektor PDF"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      # Uruchamia program z dokumentem z testu rdzenia i zapisuje zrzut okna (tryb KOREKTOR_SCREENSHOT).
+      # Maszyny GitHuba nie zawsze mają grafikę, więc niepowodzenie tego kroku nie przerywa kompilacji.
+      - name: Próbne uruchomienie (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          KOREKTOR_SCREENSHOT="$PWD/zrzut-${{ matrix.name }}.png" \
+            perl -e 'alarm 90; exec @ARGV' "dist/bin/Korektor PDF.app/Contents/MacOS/Korektor PDF" build/selftest-out/akapity.pdf
+          ls -la zrzut-*.png
+
+      - name: Obraz dysku (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ln -s /Applications dist/bin/Programy
+          for i in 1 2 3 4 5; do
+            hdiutil create -volname "Korektor PDF" -srcfolder dist/bin -ov -format UDZO "korektor-pdf-${{ matrix.name }}.dmg" && break
+            sleep 5   # hdiutil na maszynach GitHuba bywa chwilowo zajęty
+          done
+          test -f "korektor-pdf-${{ matrix.name }}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'macOS'
+        with:
+          name: korektor-pdf-${{ matrix.name }}
+          path: dist/bin
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: korektor-pdf-${{ matrix.name }}
+          path: |
+            korektor-pdf-${{ matrix.name }}.dmg
+            zrzut-${{ matrix.name }}.png
+          if-no-files-found: warn
