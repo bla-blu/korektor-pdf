@@ -6,6 +6,7 @@
 #include <fpdf_edit.h>
 #include <fpdfview.h>
 
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -44,12 +45,19 @@ struct PageEdit {
     std::vector<FPDF_PAGEOBJECT> removed;            // zdjęte ze strony (zwalniane na końcu)
     std::unordered_set<FPDF_PAGEOBJECT> added;       // dodane przez edytor
     FontCache* fonts = nullptr;
+    // Zmiany oryginalnych obiektów w miejscu (zapis odtwarza je z oryginalnych bajtów — ContentSplice):
+    std::unordered_map<FPDF_PAGEOBJECT, Xf> moved;   // przesunięte/przeskalowane: przekształcenie w przestrzeni strony
+    std::unordered_map<FPDF_PAGEOBJECT, int> styled; // kształty ze zmienionym stylem: bity kStyled*
+    std::unordered_set<FPDF_PAGEOBJECT> touchedForms;   // osadzone grafiki, z których usunięto obiekt
+    std::unordered_map<FPDF_PAGEOBJECT, FPDF_PAGEOBJECT> replaced;   // nowy obraz -> zastąpiony (zamazanie, podmiana)
 
     void remove(FPDF_PAGEOBJECT obj, FPDF_PAGEOBJECT parentForm = nullptr);
     void insertAt(FPDF_PAGEOBJECT obj, FPDF_PAGEOBJECT before);   // przed obiektem `before` (albo na końcu)
     int indexOf(FPDF_PAGEOBJECT obj) const;
     void destroyRemoved();
 };
+
+enum : int { kStyledWidth = 1, kStyledFill = 2, kStyledStroke = 4, kStyledMode = 8 };
 
 // Czcionka wybrana dla jednego stylu tekstu.
 struct StyleFont {

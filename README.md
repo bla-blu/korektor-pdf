@@ -30,6 +30,7 @@ Szybki i prosty edytor PDF w C++17. Działa na Windows, macOS i Linuksie (x64 i 
   - a przy każdym elemencie: wytnij, kopiuj, wklej, duplikuj, przywróć oryginał z pliku, usuń.
 - **Schowek elementów:** Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D kopiują, wycinają, wklejają i duplikują zaznaczony element — także na inną stronę. Kopia obrazu z pliku wygląda dokładnie jak oryginał, kopia akapitu zachowuje formatowanie; tekst trafia też do schowka systemowego.
 - **Obrazy z pliku:** kliknięcie zaznacza obraz (także leżący wewnątrz osadzonej grafiki). Można go przesunąć, zmienić rozmiar za dowolny narożnik (proporcje zostają, Shift je zwalnia), obrócić o 90°, usunąć, podmienić na inny plik albo zapisać jako PNG w oryginalnej rozdzielczości. Pasek pokazuje rozmiar w mm, w pikselach i rozdzielczość w dpi. Przesuwany obraz ma podgląd na żywo, a zapisany plik zachowuje oryginalne dane obrazu (bez ponownej kompresji).
+- **Zapis bez psucia oryginału.** Strona ze zmianami nie jest przepisywana od nowa: wszystko, czego nie zmieniłeś, trafia do pliku w oryginalnej postaci — kolory CMYK i dodatkowe (np. Pantone), profile ICC, maski przezroczystości i płynne zanikanie, nadruk, odstępy i kerning tekstu, obrazy wbudowane, cieniowania, warstwy i znaczniki struktury. Elementy przesunięte albo ze zmienionym stylem zachowują resztę wyglądu (np. kontur CMYK przy nowym wypełnieniu). Przy zmianach wewnątrz osadzonych grafik (np. zdjęć z maską zanikania w plikach z InDesign) program odtwarza ich grupy i maski, a obraz z zamazanymi pikselami rysuje z maską i obcięciem oryginału. Bez tego PDFium, które przepisuje stronę po każdej zmianie, zapisywało kolory CMYK jako czarne, gubiło maski, obrazy wbudowane i odstępy tekstu.
 - **Czysty zapis:** usunięte obrazy, zamazane fragmenty i zastąpione czcionki nie zostają w pliku jako niewidoczne obiekty — program zapisuje tylko to, czego strony faktycznie używają.
 - **Pióro** do odręcznych adnotacji i podpisów, **zakreślacz**.
 - **Obrazy** PNG, JPG, BMP i GIF, także przeciągnięte na okno.
@@ -122,9 +123,9 @@ cmake -S . -B build \
 
 ### Automatyczne kompilacje
 
-`.github/workflows/build.yml` buduje i testuje program na Linuksie (x64, ARM64), Windows i macOS (Apple Silicon — `macos-14`, Intel — `macos-15-intel`). Gotowe paczki trafiają do artefaktów przebiegu (zakładka Actions → przebieg → Artifacts). Wystarczy wypchnąć repozytorium na GitHub; dla repozytorium publicznego kompilacja jest bezpłatna. Przebieg można też uruchomić ręcznie (Actions → build → Run workflow).
+`.github/workflows/build.yml` buduje i testuje program na Linuksie (x64, ARM64), Windows i macOS. Dla macOS powstaje wersja uniwersalna (natywna na Makach z procesorem M i z Intelem), budowana na maszynie z Intelem (`macos-15-intel`), bo te są łatwo dostępne; dodatkowe zadanie na Macu z procesorem M (`macos-15`) testuje część ARM, ale bywa odrzucane z braku wolnych maszyn GitHuba — nie oznacza to błędu. Gotowe paczki trafiają do artefaktów przebiegu (zakładka Actions → przebieg → Artifacts). Wystarczy wypchnąć repozytorium na GitHub; dla repozytorium publicznego kompilacja jest bezpłatna. Przebieg można też uruchomić ręcznie (Actions → build → Run workflow).
 
-Dla macOS artefakt zawiera obraz dysku `korektor-pdf-macos-arm64.dmg` (aplikacja do przeciągnięcia do folderu Programy) oraz — jeśli maszyna GitHuba ma grafikę — zrzut okna `zrzut-macos-arm64.png` z próbnego uruchomienia programu. Przebieg sprawdza też pakiet: Info.plist, zależności i rpath, nazwę instalacyjną PDFium i podpis.
+Dla macOS artefakt `korektor-pdf-macos-universal` zawiera obraz dysku `korektor-pdf-macos-universal.dmg` (aplikacja do przeciągnięcia do folderu Programy) oraz — jeśli maszyna GitHuba ma grafikę — zrzut okna `zrzut-….png` z próbnego uruchomienia programu. Przebieg sprawdza też pakiet: Info.plist, zależności i rpath, nazwę instalacyjną PDFium i podpis.
 
 ## Obsługa
 
@@ -164,6 +165,8 @@ Na macOS zamiast Ctrl działa Cmd. Plik PDF można też podać przy uruchomieniu
 src/Document.*      model dokumentu i praca z PDF (PDFium): wczytywanie, żywy podgląd zmian,
                     rozpoznawanie akapitów ze stylami, zawijanie wierszy, obrazy z pliku, zapis
 src/Redact.cpp      zamazywanie z usunięciem treści (litery, piksele obrazów, grafika)
+src/ContentSplice.* zapis strony z oryginalnych bajtów: czytnik PDF, interpreter strumienia treści (stan
+                    graficzny każdego obiektu), składanie treści i zasobów, otoczki osadzonych grafik
 src/PdfUtil.h       wewnętrzne narzędzia rdzenia (przekształcenia, czcionki, nakładanie zmian)
 src/Fonts.*         osadzone czcionki DejaVu
 src/ImageLoad.*     wczytywanie obrazów (stb_image)
@@ -183,7 +186,9 @@ tests/selftest.cpp  test rdzenia: obroty stron, poprawianie tekstu (czcionka z p
                     zaznaczenie bez zmian (render identyczny), przesunięcie akapitu, kopia obrazu,
                     puste strony, kształty (wybór, przesunięcie, kolor, usunięcie, skala konturu,
                     osadzona grafika, kopia na inną stronę), odnośniki (odczyt, zmiana, nowe, wewnętrzne po zmianie
-                    kolejności stron, pod zamazaniem, do usuniętej strony, ponowny zapis)
+                    kolejności stron, pod zamazaniem, do usuniętej strony, ponowny zapis), zachowanie
+                    oryginalnej treści po zmianach (CMYK, kolor dodatkowy, maska, nadruk, tekst z odstępami,
+                    obraz wbudowany, cieniowanie, warstwa; strona poza zmianami identyczna co do piksela)
 ```
 
 Rdzeń (`korektor_core`) nie zależy od interfejsu. Można go użyć w innym programie albo w narzędziu wsadowym (`-DKOREKTOR_BUILD_GUI=OFF`).
@@ -202,7 +207,9 @@ Rdzeń (`korektor_core`) nie zależy od interfejsu. Można go użyć w innym pro
 - Obraz przesunięty poza swoją maskę przycinającą przesuwa ją razem z sobą; obrazy wewnątrz osadzonej grafiki są przy zmianie przenoszone na stronę, więc tracą jej obrys przycinający.
 - Obrót obrazów jest co 90°; dowolnego kąta i przycinania obrazu na razie nie ma.
 - Kształty: zmiana koloru zapisuje go jako RGB (wzory i kolory specjalne z oryginału zastępuje zwykłym kolorem); kontur rozciągnięty nierówno jest zapisywany jako nowa ścieżka bez obcięcia z oryginału. Logo złożone z wielu kształtów zaznacza się kawałkami; nowych linii i prostokątów nie da się jeszcze rysować.
-- Zapis tworzy nowy plik ze stron dokumentu: zakładki (spis treści w panelu przeglądarki) i dane formularzy z oryginału nie są przenoszone.
+- Zapis tworzy nowy plik ze stron dokumentu: zakładki (spis treści w panelu przeglądarki), dane formularzy i ustawienia warstw (które warstwy są ukryte) z oryginału nie są przenoszone.
+- Nowe i poprawione elementy (wpisany albo poprawiony tekst, wstawione obrazy, pióro, nowy kolor kształtu) są zapisywane w RGB. Zamazywanie składa pozostałe litery przeciętego wiersza na nowo, bez oryginalnych odstępów między literami, a obraz z zamazanymi pikselami zapisuje w RGB.
+- Jeśli treści strony nie da się jednoznacznie dopasować do obiektów (uszkodzony strumień treści, tekst jako ścieżka obcinająca), strona ze zmianami zapisuje się po staremu — przez PDFium. Diagnostyka: zmienna środowiskowa `KOREKTOR_SPLICE_LOG=1` wypisuje, które strony złożono z oryginału i dlaczego inne nie.
 - Plik otwarty hasłem zapisuje się bez hasła.
 - Odnośniki: edytowane są odnośniki www/e-mail i do stron dokumentu. Inne rodzaje (uruchomienie programu, otwarcie innego pliku, skrypty) zostają w pliku bez zmian, ale nie da się ich zmienić w programie; z bezpieczeństwa program otwiera tylko adresy http(s) i mailto. Odnośnik do miejsca opisanego nazwą (named destination) zapisuje się jako odnośnik do strony. Zmiana formatowania zaznaczonego (nieedytowanego) akapitu nie przesuwa jego odnośników — przy pisaniu w akapicie przesuwają się same.
 - Pola formularzy są zachowywane jako wygląd, ale po zapisie tracą interaktywność.

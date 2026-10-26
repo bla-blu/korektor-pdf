@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # macOS: najstarsza obsługiwana wersja systemu (gotowe PDFium wymaga macOS 13). Na innych systemach bez znaczenia.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Najstarsza obsługiwana wersja macOS")
-project(KorektorPDF VERSION 0.11.0 LANGUAGES C CXX)
+project(KorektorPDF VERSION 0.11.1 LANGUAGES C CXX)
 if(APPLE)
   enable_language(OBJC OBJCXX)   # obsługa macOS (src/MacOpen.mm); przed dołączeniem bibliotek
 endif()
@@ -70,6 +70,8 @@ add_library(korektor_core STATIC
   src/Document.cpp
   src/Document.h
   src/Redact.cpp
+  src/ContentSplice.cpp
+  src/ContentSplice.h
   src/PdfUtil.h
   src/Fonts.cpp
   src/Fonts.h

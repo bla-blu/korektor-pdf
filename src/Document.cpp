@@ -1,4 +1,5 @@
 #include "Document.h"
+#include "ContentSplice.h"
 #include "PdfUtil.h"
 
 #include <fpdf_annot.h>
@@ -20,8 +21,11 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace kpdf {
 
@@ -247,6 +251,7 @@ bool charsOk(const std::u32string& text, const std::u32string& ok) {
 void PageEdit::remove(FPDF_PAGEOBJECT obj, FPDF_PAGEOBJECT parentForm) {
     const bool ok = parentForm ? FPDFFormObj_RemoveObject(parentForm, obj) : FPDFPage_RemoveObject(page, obj);
     if (ok) removed.push_back(obj);
+    if (ok && parentForm) touchedForms.insert(parentForm);
 }
 
 int PageEdit::indexOf(FPDF_PAGEOBJECT obj) const {
@@ -549,13 +554,28 @@ static void applyShape(PageEdit& pe, const Page& p, const Obj& o, FPDF_PAGEOBJEC
         const Xf D = Vi.then(T).then(V);
         FPDFPageObj_Transform(path, D.a, D.b, D.c, D.d, D.e, D.f);
         if (FPDFPageObj_GetClipPath(path)) FPDFPageObj_TransformClipPath(path, D.a, D.b, D.c, D.d, D.e, D.f);
+        auto mv = pe.moved.find(path);
+        pe.moved[path] = mv != pe.moved.end() ? mv->second.then(D) : D;
     }
     const float k = matrixScale(path);   // jednostki ścieżki -> pt
-    if (o.strokeOn && (scaled || (o.shapeEdits & (kShapeWidth | kShapeStroke)))) FPDFPageObj_SetStrokeWidth(path, o.size / k);
-    if ((o.shapeEdits & kShapeFill) && o.fillMode) FPDFPageObj_SetFillColor(path, c8(o.color.r), c8(o.color.g), c8(o.color.b), c8(o.color.a));
-    if ((o.shapeEdits & kShapeStroke) && o.strokeOn)
+    int styled = 0;
+    if (o.strokeOn && (scaled || (o.shapeEdits & (kShapeWidth | kShapeStroke)))) {
+        FPDFPageObj_SetStrokeWidth(path, o.size / k);
+        styled |= kStyledWidth;
+    }
+    if ((o.shapeEdits & kShapeFill) && o.fillMode) {
+        FPDFPageObj_SetFillColor(path, c8(o.color.r), c8(o.color.g), c8(o.color.b), c8(o.color.a));
+        styled |= kStyledFill;
+    }
+    if ((o.shapeEdits & kShapeStroke) && o.strokeOn) {
         FPDFPageObj_SetStrokeColor(path, c8(o.stroke.r), c8(o.stroke.g), c8(o.stroke.b), c8(o.stroke.a));
-    if (o.shapeEdits & (kShapeFill | kShapeStroke)) FPDFPath_SetDrawMode(path, o.fillMode, o.strokeOn ? 1 : 0);
+        styled |= kStyledStroke;
+    }
+    if (o.shapeEdits & (kShapeFill | kShapeStroke)) {
+        FPDFPath_SetDrawMode(path, o.fillMode, o.strokeOn ? 1 : 0);
+        styled |= kStyledMode;
+    }
+    if (styled) pe.styled[path] |= styled;
 }
 
 } // namespace detail
@@ -641,6 +661,7 @@ void applyImageEdits(PageEdit& pe, const Page& p) {
             FPDFPageObj_GetMatrix(img, &m);
             FPDFImageObj_SetMatrix(neu, m.a, m.b, m.c, m.d, m.e, m.f);
             pe.insertAt(neu, img);
+            pe.replaced[neu] = img;
             pe.remove(img);
             img = neu;
         }
@@ -649,6 +670,8 @@ void applyImageEdits(PageEdit& pe, const Page& p) {
         if (identity) continue;
         FPDFPageObj_Transform(img, D.a, D.b, D.c, D.d, D.e, D.f);
         if (FPDFPageObj_GetClipPath(img)) FPDFPageObj_TransformClipPath(img, D.a, D.b, D.c, D.d, D.e, D.f);
+        auto mv = pe.moved.find(img);
+        pe.moved[img] = mv != pe.moved.end() ? mv->second.then(D) : D;
     }
     // 3) kształty dodane w edytorze (kopie) — nad treścią strony, w kolejności elementów
     for (const Obj& o : p.objs)
@@ -1902,6 +1925,89 @@ int writeBlock(FPDF_FILEWRITE* self, const void* data, unsigned long size) {
 }
 } // namespace
 
+namespace {
+
+// Plan zapisu strony po zmianach: które obiekty odtworzyć z oryginalnych bajtów (z ewentualnym
+// przesunięciem albo nowym stylem), a które oznaczyć znacznikiem i wziąć z zapisu PDFium.
+SplicePlan makeSplicePlan(Splicer& splicer, int page, PageEdit& pe) {
+    SplicePlan plan;
+    plan.page = page;
+    std::unordered_map<FPDF_PAGEOBJECT, int> idx;
+    for (size_t j = 0; j < pe.pristine.size(); ++j) idx[pe.pristine[j]] = int(j);
+    // osadzone grafiki, z których (także głębiej) usunięto obiekt — ich treść przepisuje PDFium
+    std::unordered_set<FPDF_PAGEOBJECT> dirtyForms;
+    if (!pe.touchedForms.empty()) {
+        std::function<bool(FPDF_PAGEOBJECT, int)> touched = [&](FPDF_PAGEOBJECT f, int depth) {
+            if (pe.touchedForms.count(f)) return true;
+            if (depth > 32) return false;
+            const int n = FPDFFormObj_CountObjects(f);
+            for (int i = 0; i < n; ++i) {
+                FPDF_PAGEOBJECT c = FPDFFormObj_GetObject(f, (unsigned long)i);
+                if (c && FPDFPageObj_GetType(c) == FPDF_PAGEOBJ_FORM && touched(c, depth + 1)) return true;
+            }
+            return false;
+        };
+        const int n = FPDFPage_CountObjects(pe.page);
+        for (int k = 0; k < n; ++k) {
+            FPDF_PAGEOBJECT o = FPDFPage_GetObject(pe.page, k);
+            if (FPDFPageObj_GetType(o) == FPDF_PAGEOBJ_FORM && touched(o, 0)) dirtyForms.insert(o);
+        }
+    }
+    const int n = FPDFPage_CountObjects(pe.page);
+    for (int k = 0; k < n; ++k) {
+        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(pe.page, k);
+        SpliceItem si;
+        const auto it = idx.find(obj);
+        si.orig = it != idx.end() ? it->second : -1;
+        if (!dirtyForms.count(obj)) {
+            if (si.orig >= 0) si.replay = true;
+            // obiekt z rozłożonej osadzonej grafiki (np. po edycji obrazu w jej wnętrzu albo zamazaniu)
+            else if (!pe.added.count(obj) && splicer.childPath(page, obj, si.path)) si.replay = true;
+        }
+        if (si.replay) {
+            if (auto mv = pe.moved.find(obj); mv != pe.moved.end()) { si.moved = true; si.move = mv->second; }
+            if (auto st = pe.styled.find(obj); st != pe.styled.end()) {
+                const int f = st->second;
+                unsigned r = 0, g = 0, b = 0, a = 255;
+                if (f & kStyledWidth) si.ovWidth = FPDFPageObj_GetStrokeWidth(obj, &si.width);
+                if ((f & kStyledFill) && FPDFPageObj_GetFillColor(obj, &r, &g, &b, &a)) {
+                    if (a != 255) si.replay = false;   // przezroczystość — stan graficzny zapisze PDFium
+                    si.ovFill = true; si.fill[0] = uint8_t(r); si.fill[1] = uint8_t(g); si.fill[2] = uint8_t(b);
+                }
+                if ((f & kStyledStroke) && FPDFPageObj_GetStrokeColor(obj, &r, &g, &b, &a)) {
+                    if (a != 255) si.replay = false;
+                    si.ovStroke = true; si.stroke[0] = uint8_t(r); si.stroke[1] = uint8_t(g); si.stroke[2] = uint8_t(b);
+                }
+                if (f & kStyledMode) {
+                    int fm = 0;
+                    FPDF_BOOL stroke = 0;
+                    if (FPDFPath_GetDrawMode(obj, &fm, &stroke)) { si.ovMode = true; si.fillMode = fm; si.strokeOn = stroke != 0; }
+                }
+            }
+        }
+        // nowy obraz w miejscu oryginału (zamazane piksele, podmiana): rysowany w kontekście zastąpionego
+        // obrazu — z jego stanem graficznym, maskami i grupami osadzonych grafik
+        if (!si.replay && si.orig < 0 && FPDFPageObj_GetType(obj) == FPDF_PAGEOBJ_IMAGE)
+            if (auto r = pe.replaced.find(obj); r != pe.replaced.end()) {
+                if (auto oi = idx.find(r->second); oi != idx.end()) { si.orig = oi->second; si.ctx = true; }
+                else if (splicer.childPath(page, r->second, si.path)) si.ctx = true;
+            }
+        if (!si.replay) {
+            si.mark = "KPDFs" + std::to_string(k);
+            FPDFPageObj_AddMark(obj, si.mark.c_str());
+        }
+        plan.items.push_back(std::move(si));
+    }
+    return plan;
+}
+
+bool spliceLogEnabled() {
+    const char* v = std::getenv("KOREKTOR_SPLICE_LOG");
+    return v && *v && *v != '0';
+}
+
+} // namespace
+
 bool Document::saveToBytes(std::vector<uint8_t>& out, std::string& err) const {
     if (pages.empty()) { err = "Dokument nie ma stron."; return false; }
     FPDF_DOCUMENT dst = FPDF_CreateNewDocument();
@@ -1941,6 +2047,26 @@ bool Document::saveToBytes(std::vector<uint8_t>& out, std::string& err) const {
         return fail("Nie udało się ułożyć stron.");
 
     // 3) Zmiany treści, nakładki i obroty.
+    //    Najpierw kopia stron przed zmianami: z niej bierzemy oryginalne bajty treści stron, żeby
+    //    PDFium nie przepisywał niezmienionych obiektów (gubi kolory CMYK, maski, odstępy tekstu…).
+    std::unique_ptr<Splicer> splicer;
+    const bool log = spliceLogEnabled();
+    const char* noSplice = std::getenv("KOREKTOR_NO_SPLICE");   // diagnostyka: dawny zapis przez PDFium
+    if (!(noSplice && *noSplice && *noSplice != '0') &&
+        std::any_of(pages.begin(), pages.end(), [](const Page& p) { return !p.objs.empty(); })) {
+        std::vector<uint8_t> origBytes;
+        Writer w0{};
+        w0.version = 1;
+        w0.WriteBlock = writeBlock;
+        w0.out = &origBytes;
+        if (FPDF_SaveAsCopy(dst, &w0, FPDF_NO_INCREMENTAL)) {
+            splicer = std::make_unique<Splicer>();
+            if (!splicer->load(std::move(origBytes))) {
+                if (log) std::fprintf(stderr, "[splice] nie udało się odczytać kopii pliku\n");
+                splicer.reset();
+            }
+        }
+    }
     for (size_t i = 0; i < pages.size(); ++i) {
         const Page& p = pages[i];
         FPDF_PAGE pg = FPDF_LoadPage(dst, int(i));
@@ -1954,6 +2080,9 @@ bool Document::saveToBytes(std::vector<uint8_t>& out, std::string& err) const {
             pe.fonts = &fonts;
             const int n = FPDFPage_CountObjects(pg);
             for (int k = 0; k < n; ++k) pe.pristine.push_back(FPDFPage_GetObject(pg, k));
+            std::string why;
+            const bool splice = splicer && splicer->prepare(int(i), pg, &why);
+            if (log && splicer && !splice) std::fprintf(stderr, "[splice] strona %d: zapis przez PDFium (%s)\n", int(i) + 1, why.c_str());
             applyContentEdits(pe, p);
 
             const Xf V = baseToPdf(p);
@@ -2011,6 +2140,7 @@ bool Document::saveToBytes(std::vector<uint8_t>& out, std::string& err) const {
                 }
                 if (obj) FPDFPage_InsertObject(pg, obj);
             }
+            if (splice) splicer->setPlan(makeSplicePlan(*splicer, int(i), pe));
             FPDFPage_GenerateContent(pg);
             pe.destroyRemoved();
         }
@@ -2027,6 +2157,11 @@ bool Document::saveToBytes(std::vector<uint8_t>& out, std::string& err) const {
     fonts.close();
     FPDF_CloseDocument(dst);
     if (!ok) { err = "Zapis PDF nie powiódł się."; return false; }
+    if (splicer) {
+        std::string diag;
+        const int n = splicer->apply(first, &diag);
+        if (log) std::fprintf(stderr, "[splice] stron złożonych z oryginału: %d\n%s", n, diag.c_str());
+    }
 
     // Drugi przebieg: kopiujemy strony do czystego dokumentu. Przenosi się tylko to, czego strony
     // faktycznie używają — usunięte obrazy, wymazane fragmenty i zastąpione czcionki nie zostają

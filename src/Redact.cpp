@@ -130,6 +130,7 @@ bool redactImage(PageEdit& pe, const Node& nd, const Box& box) {
     FPDFBitmap_Destroy(out);
     FPDFImageObj_SetMatrix(neu, img.a, img.b, img.c, img.d, img.e, img.f);
     pe.insertAt(neu, nd.top);
+    pe.replaced[neu] = nd.obj;
     pe.remove(nd.obj, nd.parent);
     return true;
 }

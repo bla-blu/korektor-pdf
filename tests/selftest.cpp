@@ -1105,27 +1105,43 @@ static FPDF_PAGEOBJECT addRect(FPDF_PAGE p, float x, float y, float w, float h, 
 }
 
 struct PathInfo { unsigned r, g, b; int fill; bool stroke; float width; Rect box; };
+// Ścieżki strony — także wewnątrz osadzonych grafik (zapis zachowuje grafiki z oryginału).
+static void collectPaths(FPDF_PAGEOBJECT o, const FS_MATRIX& toPage, const Page& ref, std::vector<PathInfo>& out) {
+    auto apply = [](const FS_MATRIX& m, float x, float y) { return std::pair<float, float>{m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f}; };
+    if (FPDFPageObj_GetType(o) == FPDF_PAGEOBJ_FORM) {
+        FS_MATRIX fm;
+        if (!FPDFPageObj_GetMatrix(o, &fm)) return;
+        const FS_MATRIX c{fm.a * toPage.a + fm.b * toPage.c, fm.a * toPage.b + fm.b * toPage.d, fm.c * toPage.a + fm.d * toPage.c,
+                          fm.c * toPage.b + fm.d * toPage.d, fm.e * toPage.a + fm.f * toPage.c + toPage.e, fm.e * toPage.b + fm.f * toPage.d + toPage.f};
+        for (int i = 0; i < FPDFFormObj_CountObjects(o); ++i) collectPaths(FPDFFormObj_GetObject(o, (unsigned long)i), c, ref, out);
+        return;
+    }
+    if (FPDFPageObj_GetType(o) != FPDF_PAGEOBJ_PATH) return;
+    PathInfo pi{};
+    unsigned a;
+    FPDFPageObj_GetFillColor(o, &pi.r, &pi.g, &pi.b, &a);
+    FPDF_BOOL st = 0;
+    FPDFPath_GetDrawMode(o, &pi.fill, &st);
+    pi.stroke = st != 0;
+    FPDFPageObj_GetStrokeWidth(o, &pi.width);
+    FS_MATRIX m;
+    FPDFPageObj_GetMatrix(o, &m);
+    pi.width *= std::sqrt(std::fabs(m.a * m.d - m.b * m.c)) * std::sqrt(std::fabs(toPage.a * toPage.d - toPage.b * toPage.c));
+    float l, b, r, t;
+    FPDFPageObj_GetBounds(o, &l, &b, &r, &t);
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (auto [x, y] : {apply(toPage, l, b), apply(toPage, r, b), apply(toPage, l, t), apply(toPage, r, t)}) {
+        x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x); y1 = std::max(y1, y);
+    }
+    const Vec2 c1 = pdfToBase(ref, x0, y0), c2 = pdfToBase(ref, x1, y1);
+    pi.box = {std::min(c1.x, c2.x), std::min(c1.y, c2.y), std::fabs(c2.x - c1.x), std::fabs(c2.y - c1.y)};
+    out.push_back(pi);
+}
+
 static std::vector<PathInfo> pagePaths(FPDF_PAGE pg, const Page& ref) {
     std::vector<PathInfo> out;
-    for (int i = 0; i < FPDFPage_CountObjects(pg); ++i) {
-        FPDF_PAGEOBJECT o = FPDFPage_GetObject(pg, i);
-        if (FPDFPageObj_GetType(o) != FPDF_PAGEOBJ_PATH) continue;
-        PathInfo pi{};
-        unsigned a;
-        FPDFPageObj_GetFillColor(o, &pi.r, &pi.g, &pi.b, &a);
-        FPDF_BOOL st = 0;
-        FPDFPath_GetDrawMode(o, &pi.fill, &st);
-        pi.stroke = st != 0;
-        FPDFPageObj_GetStrokeWidth(o, &pi.width);
-        FS_MATRIX m;
-        FPDFPageObj_GetMatrix(o, &m);
-        pi.width *= std::sqrt(std::fabs(m.a * m.d - m.b * m.c));
-        float l, b, r, t;
-        FPDFPageObj_GetBounds(o, &l, &b, &r, &t);
-        const Vec2 c1 = pdfToBase(ref, l, b), c2 = pdfToBase(ref, r, t);
-        pi.box = {std::min(c1.x, c2.x), std::min(c1.y, c2.y), std::fabs(c2.x - c1.x), std::fabs(c2.y - c1.y)};
-        out.push_back(pi);
-    }
+    const FS_MATRIX id{1, 0, 0, 1, 0, 0};
+    for (int i = 0; i < FPDFPage_CountObjects(pg); ++i) collectPaths(FPDFPage_GetObject(pg, i), id, ref, out);
     return out;
 }
 
@@ -1245,6 +1261,174 @@ static void testShapes(const std::string& outDir, int rotate) {
     });
 }
 
+// ------------------------------------------------------------------ zachowanie oryginalnej treści
+// Plik z elementami, które generator PDFium psuje przy przepisywaniu strony: kolory CMYK i dodatkowe,
+// maska przezroczystości, nadruk, odstępy i kerning tekstu, obraz wbudowany, cieniowanie, warstwa
+// ukryta, dwa strumienie treści. Po zmianach na stronie wszystko poza zmienionymi miejscami ma
+// wyglądać jak w oryginale.
+
+static std::vector<uint8_t> rawPdf(const std::vector<std::string>& objs) {
+    std::string out = "%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
+    std::vector<size_t> offs;
+    for (size_t i = 0; i < objs.size(); ++i) {
+        offs.push_back(out.size());
+        out += std::to_string(i + 1) + " 0 obj\n" + objs[i] + "\nendobj\n";
+    }
+    const size_t xref = out.size();
+    out += "xref\n0 " + std::to_string(objs.size() + 1) + "\n0000000000 65535 f \n";
+    for (size_t o : offs) {
+        char line[32];
+        std::snprintf(line, sizeof line, "%010zu 00000 n \n", o);
+        out += line;
+    }
+    out += "trailer\n<< /Size " + std::to_string(objs.size() + 1) + " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+    return std::vector<uint8_t>(out.begin(), out.end());
+}
+
+static std::string streamObj(const std::string& dict, const std::string& data) {
+    return "<< " + dict + " /Length " + std::to_string(data.size()) + " >>\nstream\n" + data + "\nendstream";
+}
+
+// Strona 1 pliku jako BGRA (1 piksel = 1 pt).
+static std::vector<uint8_t> renderPdfPage(const std::vector<uint8_t>& bytes, int& w, int& h) {
+    std::vector<uint8_t> px;
+    FPDF_DOCUMENT d = FPDF_LoadMemDocument64(bytes.data(), bytes.size(), nullptr);
+    if (!d) return px;
+    FPDF_PAGE pg = FPDF_LoadPage(d, 0);
+    w = int(FPDF_GetPageWidthF(pg));
+    h = int(FPDF_GetPageHeightF(pg));
+    FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);
+    FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
+    FPDF_RenderPageBitmap(bmp, pg, 0, 0, w, h, 0, FPDF_ANNOT);
+    const auto* b = static_cast<const uint8_t*>(FPDFBitmap_GetBuffer(bmp));
+    const int stride = FPDFBitmap_GetStride(bmp);
+    px.resize(size_t(w) * size_t(h) * 4);
+    for (int y = 0; y < h; ++y) std::memcpy(&px[size_t(y) * size_t(w) * 4], b + size_t(y) * size_t(stride), size_t(w) * 4);
+    FPDFBitmap_Destroy(bmp);
+    FPDF_ClosePage(pg);
+    FPDF_CloseDocument(d);
+    return px;
+}
+
+static void testPreservedContent(const std::string& outDir) {
+    std::printf("\n== zachowanie oryginalnej treści (CMYK, maski, nadruk, tekst, obraz wbudowany, cieniowanie)\n");
+    const std::string contentA =
+        "q\n0.1 0 0.9 0 k 50 700 200 80 re f\n/CS0 cs 1 scn 300 700 200 80 re f\n"
+        "/GS1 gs 1 0 0 0 k 50 560 200 100 re f\nQ\n"
+        "q /GS2 gs 0 1 0 0 k 300 560 200 100 re f Q\n"
+        "BT /F1 18 Tf 0 0 0 1 k 2 Tc 50 470 Td [(Kawa) -400 (Tekst)] TJ 0 -30 Td 150 Tz (Szeroki) Tj "
+        "100 Tz 5 Tw 0 -30 Td (a b c) Tj 4 Ts (r) Tj ET\n"
+        "q 40 0 0 40 300 440 cm BI /W 2 /H 2 /CS /G /BPC 8 ID \x10\x80\xC0\x40 EI Q\n"
+        "q 300 300 200 100 re W n /Sh0 sh Q\n"
+        "/OC /oc1 BDC 0.5 0 0 0 k 400 200 100 50 re f EMC\n"
+        "q 100 0 0 100 50 100 cm /Im1 Do Q\n";   // usuwany — PDFium przepisałby cały ten strumień
+    const std::string contentB =
+        "q 0 0.5 1 0 k 250 100 60 60 re f Q\n"
+        "q 0.2 0.2 0.2 0.2 K 6 w 1 0.9 0 0 k 350 100 60 60 re B Q\n";
+    std::string cmyk;
+    for (int i = 0; i < 4; ++i) cmyk += std::string("\xFF\x00\x00\x00", 4);
+    const auto src = rawPdf({
+        "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [10 0 R] /D << /OFF [10 0 R] >> >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources 4 0 R /Contents [5 0 R 6 0 R] >>",
+        "<< /Font << /F1 7 0 R >> /ExtGState << /GS1 8 0 R /GS2 11 0 R >> /ColorSpace << /CS0 12 0 R >> "
+        "/Shading << /Sh0 13 0 R >> /XObject << /Im1 14 0 R >> /Properties << /oc1 10 0 R >> >>",
+        streamObj("", contentA),
+        streamObj("", contentB),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        "<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 9 0 R >> >>",
+        streamObj("/Type /XObject /Subtype /Form /BBox [0 0 595 842] /Group << /S /Transparency /CS /DeviceGray >>",
+                  "0.5 g 0 0 595 842 re f"),
+        "<< /Type /OCG /Name (Ukryta) >>",
+        "<< /Type /ExtGState /OP true /op true /OPM 1 >>",
+        "[/Separation /Spot /DeviceCMYK 15 0 R]",
+        "<< /ShadingType 2 /ColorSpace /DeviceCMYK /Coords [300 0 500 0] /Function 16 0 R /Extend [true true] >>",
+        streamObj("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceCMYK /BitsPerComponent 8", cmyk),
+        "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 0.8 0.2 0] /N 1 >>",
+        "<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0 0] /C1 [0 0 1 0] /N 1 >>",
+    });
+    Document doc;
+    std::string err;
+    CHECK(doc.appendBytes(src, "zachowanie.pdf", "", err) == LoadResult::Ok, "wczytanie pliku testowego %s", err.c_str());
+    if (doc.pages.empty()) return;
+    Page& pg = doc.pages[0];
+    Obj img, mv, rc;
+    CHECK(doc.pickImage(pg, pdfToBase(pg, 100, 150), img), "wybór obrazu CMYK");
+    CHECK(doc.pickShape(pg, pdfToBase(pg, 280, 130), 1, mv), "wybór kształtu CMYK do przesunięcia");
+    CHECK(doc.pickShape(pg, pdfToBase(pg, 380, 130), 1, rc), "wybór kształtu z konturem CMYK");
+    img.hidden = true;
+    pg.objs.push_back(img);
+    mv.x += 30;
+    pg.objs.push_back(mv);
+    rc.color = {1, 0, 0, 1};
+    rc.shapeEdits |= kShapeFill;
+    pg.objs.push_back(rc);
+    Obj ink;
+    ink.type = ObjType::Ink;
+    ink.size = 3;
+    ink.color = {0.1f, 0.6f, 0.2f, 1};
+    for (int k = 0; k <= 20; ++k) ink.pts.push_back(pdfToBase(pg, 450 + k * 5, 400));
+    pg.objs.push_back(ink);
+    const std::string path = outDir + "/zachowanie.pdf";
+    CHECK(doc.saveToFile(path, err), "zapis %s", err.c_str());
+    std::vector<uint8_t> saved;
+    readFileBytes(path, saved);
+
+    int w = 0, h = 0, w2 = 0, h2 = 0;
+    const auto a = renderPdfPage(src, w, h), b = renderPdfPage(saved, w2, h2);
+    CHECK(!a.empty() && a.size() == b.size(), "renderowanie oryginału i zapisu (%dx%d)", w2, h2);
+    if (a.empty() || a.size() != b.size()) return;
+    struct R { float l, b, r, t; };
+    // (warstwa ukryta: zapis kopiuje strony do nowego dokumentu bez ustawień warstw katalogu — /OCProperties —
+    //  więc jej widoczność sprawdzamy po znaczniku w treści, nie po wyglądzie)
+    const R changed[] = {{50, 100, 150, 200}, {250, 100, 340, 160}, {347, 97, 413, 163}, {440, 390, 560, 410}, {400, 200, 500, 250}};
+    auto inChanged = [&](int x, int y) {
+        const float px = float(x) + 0.5f, py = float(h - y) - 0.5f;
+        for (const R& r : changed)
+            if (px > r.l - 4 && px < r.r + 4 && py > r.b - 4 && py < r.t + 4) return true;
+        return false;
+    };
+    // piksel w punkcie PDF (x, y); bufor BGRA
+    auto at = [&](const std::vector<uint8_t>& v, float x, float y) { return &v[(size_t(h - 1 - int(y)) * size_t(w) + size_t(x)) * 4]; };
+    auto same = [](const uint8_t* p, const uint8_t* q, int tol) {
+        for (int i = 0; i < 3; ++i)
+            if (std::abs(int(p[i]) - int(q[i])) > tol) return false;
+        return true;
+    };
+    int diff = 0;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            if (!inChanged(x, y) && !same(&a[(size_t(y) * size_t(w) + size_t(x)) * 4], &b[(size_t(y) * size_t(w) + size_t(x)) * 4], 8)) ++diff;
+    CHECK(diff == 0, "poza zmienionymi miejscami strona wygląda jak oryginał (różnych pikseli: %d)", diff);
+    CHECK(same(at(a, 120, 740), at(b, 120, 740), 2) && at(b, 120, 740)[1] > 150, "kolor CMYK zachowany");
+    CHECK(same(at(a, 400, 740), at(b, 400, 740), 2), "kolor dodatkowy (Separation) zachowany");
+    CHECK(same(at(a, 120, 610), at(b, 120, 610), 2), "maska przezroczystości zachowana");
+    {
+        bool ocMark = false;
+        FPDF_DOCUMENT d = FPDF_LoadMemDocument64(saved.data(), saved.size(), nullptr);
+        FPDF_PAGE sp = d ? FPDF_LoadPage(d, 0) : nullptr;
+        for (int k = 0; sp && k < FPDFPage_CountObjects(sp); ++k) {
+            FPDF_PAGEOBJECT o = FPDFPage_GetObject(sp, k);
+            for (int m = 0; m < FPDFPageObj_CountMarks(o); ++m) {
+                unsigned short name[16] = {};
+                unsigned long len = 0;
+                if (FPDFPageObjMark_GetName(FPDFPageObj_GetMark(o, (unsigned long)m), name, sizeof name, &len) && name[0] == 'O' && name[1] == 'C' && name[2] == 0)
+                    ocMark = true;
+            }
+        }
+        if (sp) FPDF_ClosePage(sp);
+        if (d) FPDF_CloseDocument(d);
+        CHECK(ocMark, "znacznik warstwy (/OC … BDC) zachowany w treści");
+    }
+    CHECK(same(at(a, 290, 130), at(b, 320, 130), 2) && at(b, 255, 130)[0] > 250, "przesunięty kształt zachował kolor CMYK");
+    const uint8_t* fill = at(b, 380, 130);
+    CHECK(fill[2] > 200 && fill[1] < 60 && fill[0] < 60, "nowe wypełnienie kształtu (BGR %d %d %d)", fill[0], fill[1], fill[2]);
+    CHECK(same(at(a, 349, 130), at(b, 349, 130), 6), "kontur CMYK kształtu z nowym wypełnieniem zachowany");
+    CHECK(at(b, 100, 150)[0] > 250 && at(b, 100, 150)[2] > 250, "usunięty obraz zniknął");
+    const uint8_t* ink2 = at(b, 500, 400);
+    CHECK(ink2[1] > ink2[2] + 40, "nowa adnotacja odręczna jest na stronie");
+}
+
 int main(int argc, char** argv) {
     const std::string outDir = argc > 1 ? argv[1] : "selftest-out";
     std::filesystem::create_directories(outDir);
@@ -1262,6 +1446,7 @@ int main(int argc, char** argv) {
     testLinks(outDir);
     testShapes(outDir, 0);
     testShapes(outDir, 1);
+    testPreservedContent(outDir);
     {
         Page p; p.width = 300; p.height = 500;
         bool inv = true;
